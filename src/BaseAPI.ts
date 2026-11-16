@@ -31,8 +31,8 @@ export interface ShipStationRateLimit {
 	 */
 	requestsPerMinute?: number;
 	/**
-	 * How long to pause the client after a 429 that says nothing about when to retry (no `Retry-After` header, and for
-	 * v1 no `X-Rate-Limit-Reset` header). Defaults to 30 seconds.
+	 * How long to pause the client after a 429 that says nothing about when to retry (no `Retry-After` and no
+	 * `X-Rate-Limit-Reset` header). Defaults to 30 seconds.
 	 */
 	fallbackPauseMs?: number;
 }
@@ -54,7 +54,10 @@ export interface ShipStationAttempt {
 	delayMs: number;
 	/** How long the attempt took from sending to its response or error */
 	durationMs: number;
-	/** Set on a 429: how long the client is now paused */
+	/**
+	 * Set when this attempt paused the client: on a 429, or when the response said no requests are left in the current
+	 * rate-limit window. How long the client is now paused.
+	 */
 	pauseMs?: number;
 	/**
 	 * ShipStation's request ID, read from the v2 error body (`request_id`). ShipStation does not document a request ID
@@ -94,6 +97,12 @@ export interface ShipStationOptions {
 }
 
 const DEFAULT_FALLBACK_PAUSE_MS = 30_000;
+// Rate-limit headers count in whole seconds, so wait a little past them to land after the reset. Octokit adds 1 s for
+// the same reason.
+const HEADER_PAUSE_BUFFER_MS = 1000;
+// ShipStation's limits are per minute, so a header asking for a longer wait is most likely wrong. A pause holds back
+// the whole client, so don't let one bad header freeze it; if the limit still holds, the next 429 pauses again.
+const MAX_HEADER_PAUSE_MS = 60_000;
 
 // Gateway failures and v1 errors don't carry the v2 error body
 const isErrorResponse = (data: unknown): data is ErrorResponse =>
@@ -132,13 +141,34 @@ const parseRetryAfter = (response: AxiosResponse) => {
 	return Number.isNaN(ms) ? undefined : Math.max(0, ms);
 };
 
-/** v1 sends the seconds left in the rate-limit window on every response */
-const parseRateLimitReset = (response: AxiosResponse) => {
-	const value = getHeader(response, "x-rate-limit-reset");
-	const seconds = Number(value);
-	return typeof value === "string" && value.trim() !== "" && seconds >= 0
-		? seconds * 1000
+const parseNumberHeader = (response: AxiosResponse, name: string) => {
+	const value = getHeader(response, name);
+	const number = Number(value);
+	return typeof value === "string" && value.trim() !== "" && number >= 0
+		? number
 		: undefined;
+};
+
+/**
+ * How long ShipStation's headers say to stop sending, if they say so. v1 documents `X-Rate-Limit-Remaining` and
+ * `X-Rate-Limit-Reset` (seconds until the window resets) on every response, and asks clients to stop once nothing is
+ * left. Those headers count every request made with the key, by any process, so they catch what pacing one client
+ * can't. v2 documents only `Retry-After` on a 429, so the rest is used only when present.
+ */
+const headerPauseMs = (response: AxiosResponse) => {
+	const isRateLimited = response.status === 429;
+	const remaining = parseNumberHeader(response, "x-rate-limit-remaining");
+	const resetSeconds = parseNumberHeader(response, "x-rate-limit-reset");
+
+	const waitMs =
+		(isRateLimited ? parseRetryAfter(response) : undefined) ??
+		((isRateLimited || remaining === 0) && resetSeconds !== undefined
+			? resetSeconds * 1000
+			: undefined);
+
+	return waitMs === undefined
+		? undefined
+		: Math.min(waitMs + HEADER_PAUSE_BUFFER_MS, MAX_HEADER_PAUSE_MS);
 };
 
 type RetryDelay = NonNullable<IAxiosRetryConfig["retryDelay"]>;
@@ -270,12 +300,11 @@ export default abstract class BaseAPI {
 		response?: AxiosResponse,
 		error?: AxiosError,
 	) {
-		let pauseMs: number | undefined;
-		if (response?.status === 429) {
-			pauseMs =
-				parseRetryAfter(response) ??
-				(this.type === "v1" ? parseRateLimitReset(response) : undefined) ??
-				this.fallbackPauseMs;
+		let pauseMs = response && headerPauseMs(response);
+		if (pauseMs === undefined && response?.status === 429) {
+			pauseMs = this.fallbackPauseMs;
+		}
+		if (pauseMs !== undefined) {
 			this.pacer.pauseFor(pauseMs);
 		}
 

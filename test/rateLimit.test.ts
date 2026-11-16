@@ -281,7 +281,7 @@ describe("retries", () => {
 });
 
 describe("429 pause", () => {
-	it("holds every request on the client until Retry-After has passed", async () => {
+	it("holds every request on the client until 1 second past Retry-After", async () => {
 		const { adapter, sentAt } = scripted(tooManyRequests(5));
 		const { v2 } = client(adapter, {
 			rateLimit: { v2: { requestsPerMinute: 600 } },
@@ -295,10 +295,10 @@ describe("429 pause", () => {
 		await advance(1000);
 		// Started after the 429
 		const later = v2.tags.get();
-		await advance(5000);
+		await advance(6000);
 		await Promise.all([waiting, later]);
 
-		expect(sentAt).toEqual([0, 5000, 5100, 5200]);
+		expect(sentAt).toEqual([0, 6000, 6100, 6200]);
 	});
 
 	it("reads Retry-After given as an HTTP date", async () => {
@@ -313,12 +313,12 @@ describe("429 pause", () => {
 			response: { status: 429 },
 		});
 		const next = v2.tags.get();
-		await advance(4000);
+		await advance(5000);
 		await next;
 
 		// HTTP dates have whole-second precision
-		expect(sentAt[1]).toBeGreaterThanOrEqual(2000);
-		expect(sentAt[1]).toBeLessThanOrEqual(3000);
+		expect(sentAt[1]).toBeGreaterThanOrEqual(3000);
+		expect(sentAt[1]).toBeLessThanOrEqual(4000);
 	});
 
 	it("falls back to a 30 second pause without Retry-After", async () => {
@@ -362,10 +362,41 @@ describe("429 pause", () => {
 			response: { status: 429 },
 		});
 		const next = v1.orders.get(2);
-		await advance(13_000, 500);
+		await advance(14_000, 500);
 		await next;
 
-		expect(sentAt).toEqual([0, 12_000]);
+		expect(sentAt).toEqual([0, 13_000]);
+	});
+
+	it("uses X-Rate-Limit-Reset for a v2 429 when ShipStation sends it", async () => {
+		const { adapter, sentAt } = scripted({
+			status: 429,
+			headers: { "X-Rate-Limit-Reset": "4" },
+		});
+		const { v2 } = client(adapter);
+
+		await expect(v2.tags.get()).rejects.toMatchObject({
+			response: { status: 429 },
+		});
+		const next = v2.tags.get();
+		await advance(6000);
+		await next;
+
+		expect(sentAt).toEqual([0, 5000]);
+	});
+
+	it("caps a pause asked for by a header at 60 seconds", async () => {
+		const { adapter, sentAt } = scripted(tooManyRequests(3600));
+		const { v2 } = client(adapter);
+
+		await expect(v2.tags.get()).rejects.toMatchObject({
+			response: { status: 429 },
+		});
+		const next = v2.tags.get();
+		await advance(61_000, 500);
+		await next;
+
+		expect(sentAt).toEqual([0, 60_000]);
 	});
 
 	it("does not pause another client", async () => {
@@ -394,10 +425,10 @@ describe("429 pause", () => {
 		});
 
 		const call = v2.tags.get();
-		await advance(3000);
+		await advance(4000);
 		await call;
 
-		expect(sentAt).toEqual([0, 2000]);
+		expect(sentAt).toEqual([0, 3000]);
 	});
 
 	it("retries a 429 with the default retryDelay once, after the pause", async () => {
@@ -407,10 +438,10 @@ describe("429 pause", () => {
 		});
 
 		const call = v2.tags.get();
-		await advance(5000);
+		await advance(6000);
 		await call;
 
-		expect(sentAt).toEqual([0, 4000]);
+		expect(sentAt).toEqual([0, 5000]);
 	});
 
 	it("retries a 429 even when Retry-After is longer than the timeout", async () => {
@@ -422,10 +453,10 @@ describe("429 pause", () => {
 		});
 
 		const call = v2.tags.get();
-		await advance(21_000, 500);
+		await advance(22_000, 500);
 		await call;
 
-		expect(sentAt).toEqual([0, 20_000]);
+		expect(sentAt).toEqual([0, 21_000]);
 	});
 
 	it("applies the pause to per-call retries of a 429, ignoring their retryDelay", async () => {
@@ -439,10 +470,86 @@ describe("429 pause", () => {
 				retryDelay: () => 60_000,
 			},
 		});
-		await advance(4000);
+		await advance(5000);
 		await call;
 
+		expect(sentAt).toEqual([0, 4000]);
+	});
+});
+
+describe("rate-limit headers", () => {
+	const noneLeft = (resetSeconds: string): Reply => ({
+		status: 200,
+		headers: {
+			"X-Rate-Limit-Remaining": "0",
+			"X-Rate-Limit-Reset": resetSeconds,
+		},
+	});
+
+	it("pauses when a v1 response says no requests are left, before any 429", async () => {
+		const { adapter, sentAt } = scripted(noneLeft("10"));
+		const { v1 } = client(adapter);
+
+		await v1.orders.get(1);
+		const next = v1.orders.get(2);
+		await advance(12_000, 500);
+		await next;
+
+		expect(sentAt).toEqual([0, 11_000]);
+	});
+
+	it("pauses a v2 client too when ShipStation sends the headers", async () => {
+		const { adapter, sentAt } = scripted(noneLeft("2"));
+		const { v2 } = client(adapter);
+
+		await v2.tags.get();
+		const next = v2.tags.get();
+		await advance(4000);
+		await next;
+
 		expect(sentAt).toEqual([0, 3000]);
+	});
+
+	it("keeps pacing as usual while requests are left", async () => {
+		const { adapter, sentAt } = scripted({
+			status: 200,
+			headers: { "X-Rate-Limit-Remaining": "3", "X-Rate-Limit-Reset": "10" },
+		});
+		const { v1 } = client(adapter);
+
+		await v1.orders.get(1);
+		const next = v1.orders.get(2);
+		await advance(2000);
+		await next;
+
+		expect(sentAt).toEqual([0, 1500]);
+	});
+
+	it("does not pause when the reset time is missing", async () => {
+		const { adapter, sentAt } = scripted({
+			status: 200,
+			headers: { "X-Rate-Limit-Remaining": "0" },
+		});
+		const { v1 } = client(adapter);
+
+		await v1.orders.get(1);
+		const next = v1.orders.get(2);
+		await advance(2000);
+		await next;
+
+		expect(sentAt).toEqual([0, 1500]);
+	});
+
+	it("reports the pause to onAttempt", async () => {
+		const { adapter } = scripted(noneLeft("10"));
+		const attempts: ShipStationAttempt[] = [];
+		const { v1 } = client(adapter, {
+			onAttempt: (attempt) => attempts.push(attempt),
+		});
+
+		await v1.orders.get(1);
+
+		expect(attempts).toMatchObject([{ status: 200, pauseMs: 11_000 }]);
 	});
 });
 
@@ -468,13 +575,13 @@ describe("onAttempt", () => {
 		});
 
 		const call = v2.rates.getById("se-1");
-		await advance(5000);
+		await advance(6000);
 		await call;
 
 		// axios-retry resends after a zero-delay timer, so a retry joins the queue one clock step after the failure
 		const delays = attempts.map(({ delayMs }) => delayMs);
 		expect(delays[0]).toBe(0);
-		expect(delays[1]).toBeWithin(1950, 2001);
+		expect(delays[1]).toBeWithin(2950, 3001);
 		expect(delays[2]).toBeWithin(950, 1001);
 
 		const reported = attempts.map(({ delayMs: _, ...rest }) => rest);
@@ -486,7 +593,7 @@ describe("onAttempt", () => {
 				errorCode: undefined,
 				retryCount: 0,
 				durationMs: 0,
-				pauseMs: 2000,
+				pauseMs: 3000,
 				requestId: "req-429",
 			},
 			{

@@ -22,6 +22,8 @@ Unofficial ShipStation API wrapper for Node.js, providing a modern, type-safe in
 
 ## Installation
 
+Requires Node.js 22 or later.
+
 ### Package manager
 
 Using npm:
@@ -164,14 +166,32 @@ const shipstation = new ShipStation({
 ```
 
 A 429 pauses the whole client. Requests that are already waiting and requests made later all wait until the
-`Retry-After` time has passed. If a v1 429 has no `Retry-After`, the client uses `X-Rate-Limit-Reset` instead. If
-neither header is there, it pauses for `fallbackPauseMs`, which defaults to 30 seconds.
+`Retry-After` time has passed. If a 429 has no `Retry-After`, the client uses `X-Rate-Limit-Reset` instead. If neither
+header is there, it pauses for `fallbackPauseMs`, which defaults to 30 seconds.
+
+The client also pauses before a 429 happens. When a response has `X-Rate-Limit-Remaining: 0`, it waits until
+`X-Rate-Limit-Reset` has passed, as ShipStation's v1 docs ask. These headers count requests from every process using
+the key, so they catch limits that pacing one client can't see. v1 sends them on every response; v2 doesn't document
+them, so for v2 they are used only if present.
+
+Pauses taken from a header last 1 second longer than the header says, because the headers count in whole seconds.
+They are also capped at 60 seconds, since ShipStation's limits are per minute. If the limit still holds after that,
+the next 429 pauses the client again.
 
 Whether a 429 is retried is still up to your retry policy (`retryConfig` or a per-call `'axios-retry'`). If it is,
 the retry goes out as soon as the pause ends, and `retryDelay` is not added on top of the pause. All other retries
 still wait for `retryDelay`. Because the pause counts as waiting for a turn, it does not use up the request's `timeout`.
 
 Pacing is per instance. To share one limit across your app, share one `ShipStation` instance.
+
+To limit how long one call may wait for its turn, give it a signal. A call that is aborted while waiting leaves the
+queue without being sent, and rejects like any canceled axios request:
+
+```ts
+const rates = await shipstation.v2.rates.get(request, { signal: AbortSignal.timeout(30_000) });
+```
+
+Note that the signal also covers the request itself once it is sent.
 
 ### Per-attempt Hook
 
@@ -189,9 +209,28 @@ const shipstation = new ShipStation({
 ```
 
 - `delayMs` is how long the attempt waited for its turn.
-- `pauseMs` is set when a 429 paused the client.
+- `pauseMs` is set when the attempt paused the client: on a 429, or when the response said no requests were left.
 - `requestId` comes from the `request_id` field of v2 error bodies. ShipStation does not document a request ID header.
 - Errors thrown by the hook are ignored.
+
+---
+
+## Migrating from 2.x to 3.0
+
+The API is unchanged. What changed:
+
+- **Node.js 22 or later is required.** Rate limiting now uses [p-queue](https://www.npmjs.com/package/p-queue), which
+  is ESM-only and needs Node.js 22. CommonJS projects keep working, because Node.js 22 and later can `require()` ES
+  modules.
+- **Requests are spaced out.** Before, a client could send its whole per-minute allowance at once. Now it starts one
+  request every `60_000 / requestsPerMinute` ms (300 ms for v2, 1.5 s for v1), and retries wait for a turn too. Set
+  `rateLimit` if you need a different rate.
+- **A 429 pauses the whole client.** All requests on the client wait until 1 second past `Retry-After`. A response
+  with `X-Rate-Limit-Remaining: 0` pauses it too, until `X-Rate-Limit-Reset` has passed.
+- **`retryDelay` no longer applies to retries of a 429.** The retry goes out when the pause ends. Other retries are
+  unchanged.
+
+See [Rate Limiting](#rate-limiting) for details.
 
 ---
 
