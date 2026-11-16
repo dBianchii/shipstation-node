@@ -24,45 +24,26 @@ export interface ShipStationRequestOptions
 export type ShipStationCallOptions = AxiosRequestConfig;
 
 export interface ShipStationRateLimit {
-	/**
-	 * Requests this client may start per minute. Starts are spaced evenly (one every `60_000 / requestsPerMinute` ms),
-	 * and every attempt takes a turn, retries included. Defaults to ShipStation's limit: 200 for v2, 40 for v1. Set it
-	 * lower when several processes share one API key.
-	 */
+	/** Evenly spaced, retries included. Defaults to 200 for v2 and 40 for v1. */
 	requestsPerMinute?: number;
-	/**
-	 * How long to pause the client after a 429 that says nothing about when to retry (no `Retry-After` and no
-	 * `X-Rate-Limit-Reset` header). Defaults to 30 seconds.
-	 */
+	/** Pause after a 429 with no `Retry-After` or `X-Rate-Limit-Reset`. Defaults to 30 seconds. */
 	fallbackPauseMs?: number;
 }
 
-/** One HTTP attempt of an SDK call. A call that is retried twice reports three attempts. */
 export interface ShipStationAttempt {
 	api: "v1" | "v2";
-	/** Upper-case HTTP method */
 	method: string;
-	/** The request URL, relative to the API's base URL */
 	url?: string;
-	/** HTTP status, when a response arrived */
 	status?: number;
-	/** The axios error code for an attempt without a response, such as `ECONNABORTED` for a timeout */
+	/** Set when no response arrived, e.g. `ECONNABORTED` */
 	errorCode?: string;
-	/** 0 for the first attempt, then the axios-retry retry number */
 	retryCount: number;
-	/** How long the attempt waited for its rate-limit turn before it was sent */
+	/** Time spent waiting for a rate-limit turn */
 	delayMs: number;
-	/** How long the attempt took from sending to its response or error */
 	durationMs: number;
-	/**
-	 * Set when this attempt paused the client: on a 429, or when the response said no requests are left in the current
-	 * rate-limit window. How long the client is now paused.
-	 */
+	/** Set when this attempt paused the client */
 	pauseMs?: number;
-	/**
-	 * ShipStation's request ID, read from the v2 error body (`request_id`). ShipStation does not document a request ID
-	 * response header, and successful responses do not carry one.
-	 */
+	/** From the v2 error body; ShipStation has no request ID header */
 	requestId?: string;
 }
 
@@ -82,26 +63,20 @@ export interface ShipStationOptions {
 		AxiosRequestConfig,
 		"baseURL" | "headers" | "axios-retry" | keyof ShipStationRequestOptions
 	>;
-	/**
-	 * axios-retry policy for every call. On a 429 the client pause decides when the retry is sent, so `retryDelay` is
-	 * not applied to retries of a 429; it still applies to every other retry.
-	 */
+	/** `retryDelay` is not applied to retries of a 429; they go out when the client pause ends. */
 	retryConfig?: IAxiosRetryConfig;
-	/** Rate limiting per API version. Each `ShipStation` instance paces its own requests. */
 	rateLimit?: {
 		v1?: ShipStationRateLimit;
 		v2?: ShipStationRateLimit;
 	};
-	/** Called after every HTTP attempt, successful or not. Errors thrown by the hook are ignored. */
+	/** Called after every HTTP attempt, retries included. Errors it throws are ignored. */
 	onAttempt?: (attempt: ShipStationAttempt) => void;
 }
 
 const DEFAULT_FALLBACK_PAUSE_MS = 30_000;
-// Rate-limit headers count in whole seconds, so wait a little past them to land after the reset. Octokit adds 1 s for
-// the same reason.
+// The headers count in whole seconds, so wait past them
 const HEADER_PAUSE_BUFFER_MS = 1000;
-// ShipStation's limits are per minute, so a header asking for a longer wait is most likely wrong. A pause holds back
-// the whole client, so don't let one bad header freeze it; if the limit still holds, the next 429 pauses again.
+// The limits are per minute, so don't let a bad header freeze the client
 const MAX_HEADER_PAUSE_MS = 60_000;
 
 // Gateway failures and v1 errors don't carry the v2 error body
@@ -120,13 +95,11 @@ const readRequestId = (data: unknown) =>
 		? data.request_id
 		: undefined;
 
-// Header names are case-insensitive, and a test adapter may hand back a plain object
 const getHeader = (response: AxiosResponse, name: string) =>
 	AxiosHeaders.from(
 		response.headers as Parameters<typeof AxiosHeaders.from>[0],
 	).get(name);
 
-/** `Retry-After` in ms, as seconds or an HTTP date */
 const parseRetryAfter = (response: AxiosResponse) => {
 	const value = getHeader(response, "retry-after");
 	if (typeof value !== "string" || value.trim() === "") {
@@ -149,12 +122,7 @@ const parseNumberHeader = (response: AxiosResponse, name: string) => {
 		: undefined;
 };
 
-/**
- * How long ShipStation's headers say to stop sending, if they say so. v1 documents `X-Rate-Limit-Remaining` and
- * `X-Rate-Limit-Reset` (seconds until the window resets) on every response, and asks clients to stop once nothing is
- * left. Those headers count every request made with the key, by any process, so they catch what pacing one client
- * can't. v2 documents only `Retry-After` on a 429, so the rest is used only when present.
- */
+// v1 sends X-Rate-Limit-* on every response; v2 documents only Retry-After, so the others are used when present
 const headerPauseMs = (response: AxiosResponse) => {
 	const isRateLimited = response.status === 429;
 	const remaining = parseNumberHeader(response, "x-rate-limit-remaining");
@@ -173,15 +141,11 @@ const headerPauseMs = (response: AxiosResponse) => {
 
 type RetryDelay = NonNullable<IAxiosRetryConfig["retryDelay"]>;
 
-// axios-retry's default delay: wait for `Retry-After` if there is one, else retry at once
+// Same as axios-retry's default
 const defaultRetryDelay: RetryDelay = (_retryCount, error) =>
 	(error.response && parseRetryAfter(error.response)) ?? 0;
 
-/**
- * The client pause already holds the retry of a 429 back until ShipStation accepts requests again, so axios-retry
- * resends it at once and the retry waits for its turn like any other request. Waiting for `retryDelay` as well would
- * add the two delays together.
- */
+// The client pause already delays the retry of a 429, so don't add retryDelay on top
 const skipDelayOn429 =
 	(retryDelay: RetryDelay = defaultRetryDelay): RetryDelay =>
 	(retryCount, error) =>
@@ -224,8 +188,7 @@ export default abstract class BaseAPI {
 			rateLimit?.fallbackPauseMs ?? DEFAULT_FALLBACK_PAUSE_MS;
 		this.onAttempt = options.onAttempt;
 
-		// axios runs response interceptors in the order they were added. This one goes before axios-retry's, so it sees
-		// every attempt (and pauses the client on a 429) before axios-retry decides whether to resend.
+		// Added before axios-retry so it sees each attempt before axios-retry resends it
 		this.http.interceptors.response.use(
 			(response) => {
 				this.afterAttempt(response.config, response);
@@ -239,16 +202,14 @@ export default abstract class BaseAPI {
 			},
 		);
 
-		// Retry failed requests. Always installed, so a per-call "axios-retry" policy works on a client without
-		// retryConfig; such a client still never retries by default.
+		// Always installed so a per-call "axios-retry" policy works without retryConfig
 		const retryConfig = options.retryConfig ?? { retries: 0 };
 		axiosRetry(this.http, {
 			...retryConfig,
 			retryDelay: skipDelayOn429(retryConfig.retryDelay),
 		});
 
-		// axios runs request interceptors in reverse order, so this one runs before axios-retry's. It runs for every
-		// attempt, retries included, and axios-retry only starts the attempt's clock (for `timeout`) once it is sent.
+		// Request interceptors run in reverse order, so this waits before axios-retry starts the timeout clock
 		this.http.interceptors.request.use(async (config) => {
 			const queuedAt = Date.now();
 			await this.pacer.waitForTurn(config.signal);
@@ -327,7 +288,7 @@ export default abstract class BaseAPI {
 				requestId: readRequestId(response?.data),
 			});
 		} catch {
-			// A logging hook must not change the outcome of the request
+			// Ignore hook errors
 		}
 	}
 }

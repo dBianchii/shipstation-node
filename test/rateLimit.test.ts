@@ -17,10 +17,7 @@ type Reply =
 	| { status: number; headers?: Record<string, string>; data?: unknown }
 	| "timeout";
 
-/**
- * An adapter that answers each request with the next reply (200 once they run out) and records the fake-clock time
- * each request was sent, relative to when the test started.
- */
+// Replies in order, then 200s; records when each request was sent
 const scripted = (...replies: Reply[]) => {
 	const sentAt: number[] = [];
 	const urls: (string | undefined)[] = [];
@@ -69,7 +66,6 @@ const tooManyRequests = (retryAfterSeconds?: number): Reply => ({
 // setImmediate is not faked, so waiting for it drains every pending promise callback
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
-/** Moves the fake clock forward in small steps, letting requests progress between steps */
 const advance = async (ms: number, step = 50) => {
 	await settle();
 	for (let elapsed = 0; elapsed < ms; elapsed += step) {
@@ -92,7 +88,7 @@ const originalAdapter = axios.defaults.adapter;
 
 beforeEach(() => {
 	jest.useFakeTimers();
-	// A broken transport must fail locally instead of contacting ShipStation.
+	// Never reach ShipStation
 	axios.defaults.adapter = () => Promise.reject(new Error("no network"));
 });
 

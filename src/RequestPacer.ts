@@ -1,13 +1,7 @@
 import type { GenericAbortSignal } from "axios";
 import PQueue from "p-queue";
 
-/**
- * Hands out turns to start requests, one at a time and evenly spaced, in the order they were asked for.
- *
- * A p-queue with one start per `60_000 / requestsPerMinute` ms does the spacing. Its sliding window (`strict`) means
- * no two starts are ever closer than that, even across window boundaries. A 429 pauses the queue, which holds back
- * requests that are already waiting as well as new ones.
- */
+/** Hands out evenly spaced turns to start requests, in call order. */
 export class RequestPacer {
 	readonly intervalMs: number;
 	private readonly queue: PQueue;
@@ -29,14 +23,10 @@ export class RequestPacer {
 		});
 	}
 
-	/**
-	 * Resolves when the caller may start its request. If `signal` aborts while waiting, the caller leaves the queue
-	 * without taking a turn, and this resolves so that axios cancels the request before sending it.
-	 */
+	/** On abort, leaves the queue and resolves so axios cancels the request unsent. */
 	async waitForTurn(signal?: GenericAbortSignal) {
 		try {
 			await this.queue.add(() => {}, {
-				// p-queue needs a real AbortSignal to listen to
 				signal: signal instanceof AbortSignal ? signal : undefined,
 			});
 		} catch (error) {
@@ -46,7 +36,6 @@ export class RequestPacer {
 		}
 	}
 
-	/** Holds back every turn, including those already waiting, until `ms` from now. */
 	pauseFor(ms: number) {
 		const until = Date.now() + ms;
 		if (until <= this.pausedUntil) {
