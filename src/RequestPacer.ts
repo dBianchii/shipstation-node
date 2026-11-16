@@ -3,7 +3,6 @@ import PQueue from "p-queue";
 
 /** Hands out evenly spaced turns to start requests, in call order. */
 export class RequestPacer {
-	readonly intervalMs: number;
 	private readonly queue: PQueue;
 	private pausedUntil = 0;
 	private resumeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -15,10 +14,9 @@ export class RequestPacer {
 			);
 		}
 
-		this.intervalMs = 60_000 / requestsPerMinute;
 		this.queue = new PQueue({
 			intervalCap: 1,
-			interval: this.intervalMs,
+			interval: 60_000 / requestsPerMinute,
 			strict: true,
 		});
 	}

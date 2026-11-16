@@ -7,7 +7,7 @@ import type {
 } from "axios";
 import axios, { AxiosHeaders, isAxiosError } from "axios";
 import type { IAxiosRetryConfig } from "axios-retry";
-import axiosRetry from "axios-retry";
+import axiosRetry, { DEFAULT_OPTIONS } from "axios-retry";
 
 import { RequestPacer } from "./RequestPacer";
 import { type ErrorResponse, ShipStationError } from "./v2/types/models/Error";
@@ -95,10 +95,8 @@ const readRequestId = (data: unknown) =>
 		? data.request_id
 		: undefined;
 
-const getHeader = (response: AxiosResponse, name: string) =>
-	AxiosHeaders.from(
-		response.headers as Parameters<typeof AxiosHeaders.from>[0],
-	).get(name);
+const getHeader = ({ headers }: AxiosResponse, name: string) =>
+	headers instanceof AxiosHeaders ? headers.get(name) : undefined;
 
 const parseRetryAfter = (response: AxiosResponse) => {
 	const value = getHeader(response, "retry-after");
@@ -141,13 +139,9 @@ const headerPauseMs = (response: AxiosResponse) => {
 
 type RetryDelay = NonNullable<IAxiosRetryConfig["retryDelay"]>;
 
-// Same as axios-retry's default
-const defaultRetryDelay: RetryDelay = (_retryCount, error) =>
-	(error.response && parseRetryAfter(error.response)) ?? 0;
-
 // The client pause already delays the retry of a 429, so don't add retryDelay on top
 const skipDelayOn429 =
-	(retryDelay: RetryDelay = defaultRetryDelay): RetryDelay =>
+	(retryDelay: RetryDelay = DEFAULT_OPTIONS.retryDelay): RetryDelay =>
 	(retryCount, error) =>
 		error.response?.status === 429 ? 0 : retryDelay(retryCount, error);
 

@@ -74,10 +74,27 @@ const advance = async (ms: number, step = 50) => {
 	}
 };
 
-const client = (
-	adapter: AxiosAdapter,
-	options: Omit<ShipStationOptions, "credentials" | "requestConfig"> = {},
-) => new ShipStation({ credentials, requestConfig: { adapter }, ...options });
+type ClientOptions = Omit<ShipStationOptions, "credentials" | "requestConfig">;
+
+const client = (adapter: AxiosAdapter, options: ClientOptions = {}) =>
+	new ShipStation({ credentials, requestConfig: { adapter }, ...options });
+
+// Sends a request that gets `reply`, then a second one; returns when each was sent
+const sendTwo = async (
+	api: "v1" | "v2",
+	reply: Reply,
+	options?: ClientOptions,
+) => {
+	const { adapter, sentAt } = scripted(reply);
+	const target = client(adapter, options)[api];
+
+	await target.request({ url: "first" }).catch(() => {});
+	const second = target.request({ url: "second" });
+	await advance(61_000, 500);
+	await second;
+
+	return sentAt;
+};
 
 const is429: IAxiosRetryConfig["retryCondition"] = (error) =>
 	error.response?.status === 429;
@@ -318,79 +335,39 @@ describe("429 pause", () => {
 	});
 
 	it("falls back to a 30 second pause without Retry-After", async () => {
-		const { adapter, sentAt } = scripted(tooManyRequests());
-		const { v2 } = client(adapter);
-
-		await expect(v2.tags.get()).rejects.toMatchObject({
-			response: { status: 429 },
-		});
-		const next = v2.tags.get();
-		await advance(31_000, 500);
-		await next;
+		const sentAt = await sendTwo("v2", tooManyRequests());
 
 		expect(sentAt).toEqual([0, 30_000]);
 	});
 
 	it("uses the configured fallback pause", async () => {
-		const { adapter, sentAt } = scripted(tooManyRequests());
-		const { v2 } = client(adapter, {
+		const sentAt = await sendTwo("v2", tooManyRequests(), {
 			rateLimit: { v2: { fallbackPauseMs: 7000 } },
 		});
-
-		await expect(v2.tags.get()).rejects.toMatchObject({
-			response: { status: 429 },
-		});
-		const next = v2.tags.get();
-		await advance(8000);
-		await next;
 
 		expect(sentAt).toEqual([0, 7000]);
 	});
 
 	it("uses X-Rate-Limit-Reset for a v1 429 without Retry-After", async () => {
-		const { adapter, sentAt } = scripted({
+		const sentAt = await sendTwo("v1", {
 			status: 429,
 			headers: { "X-Rate-Limit-Reset": "12" },
 		});
-		const { v1 } = client(adapter);
-
-		await expect(v1.orders.get(1)).rejects.toMatchObject({
-			response: { status: 429 },
-		});
-		const next = v1.orders.get(2);
-		await advance(14_000, 500);
-		await next;
 
 		expect(sentAt).toEqual([0, 13_000]);
 	});
 
 	it("uses X-Rate-Limit-Reset for a v2 429 when ShipStation sends it", async () => {
-		const { adapter, sentAt } = scripted({
+		const sentAt = await sendTwo("v2", {
 			status: 429,
 			headers: { "X-Rate-Limit-Reset": "4" },
 		});
-		const { v2 } = client(adapter);
-
-		await expect(v2.tags.get()).rejects.toMatchObject({
-			response: { status: 429 },
-		});
-		const next = v2.tags.get();
-		await advance(6000);
-		await next;
 
 		expect(sentAt).toEqual([0, 5000]);
 	});
 
 	it("caps a pause asked for by a header at 60 seconds", async () => {
-		const { adapter, sentAt } = scripted(tooManyRequests(3600));
-		const { v2 } = client(adapter);
-
-		await expect(v2.tags.get()).rejects.toMatchObject({
-			response: { status: 429 },
-		});
-		const next = v2.tags.get();
-		await advance(61_000, 500);
-		await next;
+		const sentAt = await sendTwo("v2", tooManyRequests(3600));
 
 		expect(sentAt).toEqual([0, 60_000]);
 	});
@@ -483,55 +460,31 @@ describe("rate-limit headers", () => {
 	});
 
 	it("pauses when a v1 response says no requests are left, before any 429", async () => {
-		const { adapter, sentAt } = scripted(noneLeft("10"));
-		const { v1 } = client(adapter);
-
-		await v1.orders.get(1);
-		const next = v1.orders.get(2);
-		await advance(12_000, 500);
-		await next;
+		const sentAt = await sendTwo("v1", noneLeft("10"));
 
 		expect(sentAt).toEqual([0, 11_000]);
 	});
 
 	it("pauses a v2 client too when ShipStation sends the headers", async () => {
-		const { adapter, sentAt } = scripted(noneLeft("2"));
-		const { v2 } = client(adapter);
-
-		await v2.tags.get();
-		const next = v2.tags.get();
-		await advance(4000);
-		await next;
+		const sentAt = await sendTwo("v2", noneLeft("2"));
 
 		expect(sentAt).toEqual([0, 3000]);
 	});
 
 	it("keeps pacing as usual while requests are left", async () => {
-		const { adapter, sentAt } = scripted({
+		const sentAt = await sendTwo("v1", {
 			status: 200,
 			headers: { "X-Rate-Limit-Remaining": "3", "X-Rate-Limit-Reset": "10" },
 		});
-		const { v1 } = client(adapter);
-
-		await v1.orders.get(1);
-		const next = v1.orders.get(2);
-		await advance(2000);
-		await next;
 
 		expect(sentAt).toEqual([0, 1500]);
 	});
 
 	it("does not pause when the reset time is missing", async () => {
-		const { adapter, sentAt } = scripted({
+		const sentAt = await sendTwo("v1", {
 			status: 200,
 			headers: { "X-Rate-Limit-Remaining": "0" },
 		});
-		const { v1 } = client(adapter);
-
-		await v1.orders.get(1);
-		const next = v1.orders.get(2);
-		await advance(2000);
-		await next;
 
 		expect(sentAt).toEqual([0, 1500]);
 	});
